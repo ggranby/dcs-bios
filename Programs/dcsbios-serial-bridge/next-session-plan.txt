@@ -1,0 +1,138 @@
+DCS-BIOS Serial Bridge - Next Session Plan
+Date: 2026-04-14
+Priority Theme: UI throughput and logging reliability
+
+1) UI Throughput Rewrite (First Work Item)
+- Replace direct per-message UI appends with a producer/consumer queue.
+- Bridge thread pushes log events to queue only.
+- UI thread flushes queued events on timer (target 20-40 ms cadence).
+- Render in chunks (batch append), not line-by-line.
+- Add bounded UI ring buffer by line count to keep rendering cost stable.
+
+Acceptance:
+- UI remains responsive during 2k+ lines/min sustained input.
+- No lockups while bridge is running.
+
+2) Backpressure and Observability
+- Add live counters in status area:
+  - queueDepth
+  - droppedUiLines
+  - linesReceivedPerSec
+  - linesRenderedPerSec
+  - avgFlushMs / maxFlushMs
+- If queue exceeds threshold, show warning in status and increment droppedUiLines.
+- Preserve full export stream integrity independent of UI drop behavior.
+
+Acceptance:
+- Operator can always see whether UI is falling behind.
+- Dropped UI lines never imply dropped export log lines.
+
+3) Logging Channel Controls (Options Menu)
+- Add explicit channel toggles:
+  - Control Changes
+  - Raw Knobs/Dials
+  - Raw Gauges
+  - Transport Diagnostics
+- Keep defaults:
+  - Control Changes: ON
+  - Raw Knobs/Dials: ON
+  - Raw Gauges: OFF
+  - Diagnostics: OFF
+- Apply changes at runtime if feasible; if not, apply on next Start with clear notice.
+
+Acceptance:
+- User can reduce high-volume channels without code changes.
+
+4) Memory and Retention Policy
+- Keep UI text as fixed-size ring buffer (line-limited).
+- Keep full in-memory log optional (toggle: Full Capture).
+- If Full Capture OFF, stream to file and retain only UI ring buffer.
+- Expose current memory mode in UI.
+
+Acceptance:
+- Long sessions do not show unbounded memory growth from UI text.
+
+5) Output Consistency Rules
+- Log only changed values (no duplicates for unchanged rendered state).
+- Use wire-format-only output (no human-readable suffix text):
+  IDENTIFIER SET_STATE VALUE
+- Ensure baseline/startup settle behavior remains configurable and clear.
+
+Requirement Added:
+- Logging output must contain only DCS-BIOS reference strings that are sent/consumed by endpoints.
+- Remove human-readable label/value text from runtime log lines.
+
+Acceptance:
+- Idle cockpit produces stable/minimal output after settle window.
+
+6) Stress Test Matrix (Run Next Session)
+- Test A: Idle mission, 10 min
+- Test B: Rapid switch spam, 2 min
+- Test C: Knob sweep, 2 min
+- Test D: Gauge-heavy mode, 2 min (Raw Gauges ON)
+- For each test, capture:
+  - max queueDepth
+  - droppedUiLines
+  - avg/max flush ms
+  - export line count
+
+Pass Criteria:
+- No UI freeze.
+- No sustained queue growth in normal operation.
+- Exported line count matches received event count.
+
+7) Code Quality and Reorganization Pass (Required)
+- Add thorough, meaningful comments to all touched code paths:
+  - explain purpose, data flow, threading behavior, and non-obvious edge cases
+  - avoid trivial comments that restate obvious syntax
+- Run a cleanup/reorganization pass after feature work:
+  - group related functions and structs
+  - normalize naming and section boundaries
+  - remove dead/debug-only code that is no longer needed
+  - keep behavior unchanged during cleanup unless explicitly intended
+- For each module touched, include a quick readability check:
+  - can a new contributor follow control flow without external context?
+
+Acceptance:
+- New/modified code is commented clearly enough for maintenance handoff.
+- File organization is cleaner and easier to navigate than pre-pass state.
+- Cleanup pass introduces no behavior regression in stress tests.
+
+8) Board-to-Panel Association Framework (New)
+- Build a GUI workflow to map physical boards (Arduino or other serial devices) to logical cockpit panels.
+- Add a board discovery layer:
+  - enumerate connected serial devices
+  - collect stable identity hints (COM port, VID/PID when available, optional device-reported name)
+  - track reconnects and port renumbering behavior
+- Add panel mapping UI:
+  - create/edit panel profiles
+  - assign one or more boards to each panel
+  - persist mappings to config file for automatic restore on startup
+- Add communication verification tools:
+  - per-board heartbeat/handshake status
+  - send test command and verify response/roundtrip
+  - visual status indicators (Connected / Degraded / No Data)
+- Add auto-association strategy (phase 1):
+  - exact match on persisted board identity
+  - fallback to user confirmation if ambiguous
+  - never silently remap when identity confidence is low
+
+Acceptance:
+- User can connect multiple boards and map them to panels through GUI without manual script edits.
+- Mappings are restored automatically after restart and after COM port number changes when identity is known.
+- Verification view can confirm communication health per board before mission start.
+- Ambiguous hardware matches require explicit user confirmation.
+
+Implementation Order (Next Session)
+1. Queue + batched flush path
+2. Counters and backpressure indicators
+3. Options panel channel toggles
+4. Memory retention modes
+5. Board discovery + panel mapping data model
+6. Board verification UI and handshake checks
+7. Code quality comments + reorganization pass
+8. Stress tests and tuning
+
+Notes
+- UI is currently the bottleneck, not protocol parsing.
+- Keep export log path authoritative; UI is a view layer.
