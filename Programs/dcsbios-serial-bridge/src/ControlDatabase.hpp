@@ -61,6 +61,13 @@ public:
         return &it->second;
     }
 
+    template <typename Callback>
+    void forEachControl(Callback&& callback) const {
+        for (const auto& entry : byId_) {
+            callback(entry.second);
+        }
+    }
+
     bool empty() const { return byId_.empty(); }
 
 private:
@@ -198,45 +205,30 @@ private:
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// HumanReadable
-//   Converts a dirty word list + state map into human-readable change lines.
+// Runtime state-change logging helpers
+//   The serial bridge log is intended to mirror the plain-text command format
+//   that endpoints send and consume. Keep comparison and rendering separate so
+//   deduplication is driven by the underlying control value, not by any future
+//   presentation tweak to the log line.
 // ─────────────────────────────────────────────────────────────────────────────
-inline std::wstring FormatChange(const ControlDescriptor& desc, const BiosStateMap& state) {
-    auto trim = [](std::wstring value) {
-        while (!value.empty() && iswspace(value.front())) value.erase(value.begin());
-        while (!value.empty() && iswspace(value.back())) value.pop_back();
-        return value;
-    };
+inline uint32_t ReadControlValue(const ControlDescriptor& desc, const BiosStateMap& state) {
+    if (desc.isString) {
+        uint32_t hash = 2166136261u;
+        for (uint16_t i = 0; i < desc.strLen; ++i) {
+            char ch = static_cast<char>(state.raw()[desc.byteAddr + i]);
+            if (ch == 0) break;
+            hash ^= static_cast<uint8_t>(ch);
+            hash *= 16777619u;
+        }
+        return hash;
+    }
 
+    return state.readField(desc.byteAddr, desc.mask, desc.shift);
+}
+
+inline std::wstring FormatWireStateChange(const ControlDescriptor& desc, const BiosStateMap& state) {
     auto toWide = [](const std::string& value) {
         return std::wstring(value.begin(), value.end());
-    };
-
-    auto splitPositions = [&](const std::wstring& description) {
-        std::vector<std::wstring> positions;
-        auto comma = description.find(L',');
-        if (comma == std::wstring::npos) return positions;
-
-        std::wstring suffix = trim(description.substr(comma + 1));
-        size_t start = 0;
-        while (start < suffix.size()) {
-            size_t slash = suffix.find(L'/', start);
-            std::wstring token = trim(suffix.substr(start, slash == std::wstring::npos ? std::wstring::npos : slash - start));
-            if (!token.empty()) positions.push_back(token);
-            if (slash == std::wstring::npos) break;
-            start = slash + 1;
-        }
-        return positions;
-    };
-
-    auto displayLabel = [&](const ControlDescriptor& control) {
-        std::wstring description = trim(toWide(control.description));
-        auto comma = description.find(L',');
-        if (comma != std::wstring::npos) {
-            description = trim(description.substr(0, comma));
-        }
-        if (!description.empty()) return description;
-        return toWide(control.identifier);
     };
 
     wchar_t buf[512];
@@ -247,33 +239,14 @@ inline std::wstring FormatChange(const ControlDescriptor& desc, const BiosStateM
             if (ch == 0) break;
             s += ch;
         }
-        std::wstring label = displayLabel(desc);
-        std::wstring id    = toWide(desc.identifier);
+
+        std::wstring id = toWide(desc.identifier);
         std::wstring ws(s.begin(), s.end());
-        // Wire format: IDENTIFIER SET_STATE "value"  (Label: "value")
-        swprintf_s(buf, L"%s SET_STATE \"%s\"  (%s: \"%s\")", id.c_str(), ws.c_str(), label.c_str(), ws.c_str());
+        swprintf_s(buf, L"%s SET_STATE \"%s\"", id.c_str(), ws.c_str());
     } else {
-        uint16_t val = state.readField(desc.byteAddr, desc.mask, desc.shift);
-        std::wstring label = displayLabel(desc);
-        std::wstring id    = toWide(desc.identifier);
-        std::wstring valueText;
-        auto positions = splitPositions(toWide(desc.description));
-
-        if (desc.maxVal == 1) {
-            if (positions.size() == 2) {
-                valueText = (val == 0) ? positions[1] : positions[0];
-            } else {
-                valueText = (val == 0) ? L"OFF" : L"ON";
-            }
-        } else if (!positions.empty() && val < positions.size()) {
-            valueText = positions[val];
-        } else {
-            valueText = std::to_wstring(static_cast<unsigned>(val));
-        }
-
-        // Wire format: IDENTIFIER SET_STATE N  (Human Label: State)
-        swprintf_s(buf, L"%s SET_STATE %u  (%s: %s)",
-                   id.c_str(), static_cast<unsigned>(val), label.c_str(), valueText.c_str());
+        uint32_t val = ReadControlValue(desc, state);
+        std::wstring id = toWide(desc.identifier);
+        swprintf_s(buf, L"%s SET_STATE %u", id.c_str(), static_cast<unsigned>(val));
     }
     return buf;
 }
