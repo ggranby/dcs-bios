@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cwctype>
 #include <filesystem>
 #include <fstream>
@@ -57,7 +58,11 @@ constexpr int kHotkeyId  = 1;
 constexpr int kLogMessage          = WM_APP + 1;
 constexpr int kBridgeStoppedMessage = WM_APP + 2;
 constexpr UINT_PTR kLogFlushTimer = 42;
+constexpr UINT_PTR kStatusRefreshTimer = 43;
 constexpr UINT_PTR kLogFlushIntervalMs = 50;
+constexpr UINT_PTR kStatusRefreshIntervalMs = 250;
+constexpr size_t kMaxPendingUiLines = 2000;
+constexpr size_t kMaxUiDisplayLines = 400;
 
 constexpr UINT_PTR kControlMode       = 1001;
 constexpr UINT_PTR kControlPorts      = 1002;
@@ -263,6 +268,15 @@ static std::string FindJsonDir() {
 
 class BridgeController {
 public:
+    struct DispatchMetricsSnapshot {
+        uint64_t framesObserved = 0;
+        uint64_t framesWithSerialWrites = 0;
+        uint64_t avgDispatchUs = 0;
+        uint64_t maxDispatchUs = 0;
+        uint64_t avgPortWriteUs = 0;
+        uint64_t maxPortWriteUs = 0;
+    };
+
     explicit BridgeController(HWND hwnd) : hwnd_(hwnd), exportParser_(stateMap_) {}
     ~BridgeController() { Stop(); }
 
@@ -299,7 +313,7 @@ public:
 
         logStateChanges_ = config.logStateChanges;
         logStateChangesPrimed_ = false;
-        lastLoggedStates_.clear();
+        lastLoggedValues_.clear();
         logStateChangesArmedAt_ = std::chrono::steady_clock::now() + std::chrono::seconds(15);
         logStateChangesArmedNoticeSent_ = false;
         exportParser_.onFrameSync = [this]() { OnFrameSync(); };
@@ -312,6 +326,13 @@ public:
 
         running_ = true;
         frameCounter_ = 0;
+        dispatchFramesMeasured_ = 0;
+        dispatchFramesWithWrites_ = 0;
+        portWritesMeasured_ = 0;
+        avgDispatchUs_ = 0;
+        maxDispatchUs_ = 0;
+        avgPortWriteUs_ = 0;
+        maxPortWriteUs_ = 0;
         worker_ = std::thread(&BridgeController::RunLoop, this);
         PostLog(hwnd_, L"Bridge started.");
         return true;
@@ -331,6 +352,17 @@ public:
     }
 
     bool IsRunning() const { return running_; }
+
+    DispatchMetricsSnapshot GetDispatchMetrics() const {
+        return DispatchMetricsSnapshot{
+            dispatchFramesMeasured_.load(),
+            dispatchFramesWithWrites_.load(),
+            avgDispatchUs_.load(),
+            maxDispatchUs_.load(),
+            avgPortWriteUs_.load(),
+            maxPortWriteUs_.load(),
+        };
+    }
 
     // In-process self-test: exercises protocol parser, state machine, and
     // import line parser with synthetic data.
@@ -608,6 +640,8 @@ private:
         ++frameCounter_;
         auto dirty = stateMap_.takeDirty();
         uint64_t fc = frameCounter_.load();
+        auto dispatchStartedAt = std::chrono::steady_clock::now();
+        uint64_t portWritesThisFrame = 0;
 
         // Dispatch delta to devices (skip in dry-run)
         if (!config_.dryRun) {
@@ -615,9 +649,18 @@ private:
                 if (sp->handle == INVALID_HANDLE_VALUE) continue;
                 auto frame = BuildDeltaFrame(stateMap_, dirty, sp->info);
                 if (!frame.empty()) {
+                    auto writeStartedAt = std::chrono::steady_clock::now();
                     DWORD written = 0;
                     BOOL ok = WriteFile(sp->handle, frame.data(),
                                         static_cast<DWORD>(frame.size()), &written, nullptr);
+                    auto writeFinishedAt = std::chrono::steady_clock::now();
+                    uint64_t writeUs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(writeFinishedAt - writeStartedAt).count());
+                    ++portWritesThisFrame;
+                    uint64_t measuredPortWrites = ++portWritesMeasured_;
+                    uint64_t prevAvgPortWriteUs = avgPortWriteUs_.load();
+                    int64_t portDeltaUs = static_cast<int64_t>(writeUs) - static_cast<int64_t>(prevAvgPortWriteUs);
+                    avgPortWriteUs_ = static_cast<uint64_t>(static_cast<int64_t>(prevAvgPortWriteUs) + (portDeltaUs / static_cast<int64_t>(measuredPortWrites)));
+                    maxPortWriteUs_ = std::max(maxPortWriteUs_.load(), writeUs);
                     if (!ok || written != static_cast<DWORD>(frame.size())) {
                         std::wstringstream m;
                         m << L"Write failed on COM" << sp->comPort << L".";
@@ -627,58 +670,94 @@ private:
             }
         }
 
-        // Human-readable state change log (capped at 20 lines per frame)
-        if (logStateChanges_ && !controlDb_.empty() && !dirty.empty()) {
+        uint64_t frameDispatchUs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - dispatchStartedAt).count());
+        uint64_t dispatchFramesMeasured = ++dispatchFramesMeasured_;
+        uint64_t prevAvgDispatchUs = avgDispatchUs_.load();
+        int64_t dispatchDeltaUs = static_cast<int64_t>(frameDispatchUs) - static_cast<int64_t>(prevAvgDispatchUs);
+        avgDispatchUs_ = static_cast<uint64_t>(static_cast<int64_t>(prevAvgDispatchUs) + (dispatchDeltaUs / static_cast<int64_t>(dispatchFramesMeasured)));
+        maxDispatchUs_ = std::max(maxDispatchUs_.load(), frameDispatchUs);
+        if (portWritesThisFrame > 0) {
+            ++dispatchFramesWithWrites_;
+        }
+
+        // Runtime log lines are a UI view over the authoritative export stream.
+        // They intentionally report only state transitions after the startup
+        // settle window so the operator sees actionable changes instead of the
+        // constant redraw churn generated by DCS while a cockpit initializes.
+        if (logStateChanges_ && !controlDb_.empty()) {
             bool loggingArmed = std::chrono::steady_clock::now() >= logStateChangesArmedAt_;
+            bool seededBaselineThisFrame = false;
             if (loggingArmed && !logStateChangesArmedNoticeSent_) {
+                // Seed every eligible control from the fully-settled state map before
+                // emitting runtime changes. Without this, the first activity on a shared
+                // address word can dump every sibling control on that word because those
+                // identifiers have no baseline yet.
+                lastLoggedValues_.clear();
+                controlDb_.forEachControl([&](const ControlDescriptor& desc) {
+                    if (!ShouldLogStateChange(desc,
+                                              config_.logRawKnobsDials,
+                                              config_.logRawGauges)) return;
+                    lastLoggedValues_[desc.identifier] = ReadControlValue(desc, stateMap_);
+                });
+                logStateChangesPrimed_ = true;
+                seededBaselineThisFrame = true;
                 PostLog(hwnd_, L"State-change logging armed (startup settle complete).");
                 logStateChangesArmedNoticeSent_ = true;
             }
 
-            std::unordered_set<std::string> seenIds;
-            size_t changedCount = 0;
-            size_t emittedCount = 0;
-            for (uint16_t addr : dirty) {
-                const auto* list = controlDb_.lookupByAddr(addr);
-                if (list) {
-                    for (const auto* desc : *list) {
-                        if (!seenIds.insert(desc->identifier).second) continue;
-                        if (!ShouldLogStateChange(*desc,
-                                                  config_.logRawKnobsDials,
-                                                  config_.logRawGauges)) continue;
+            if (!dirty.empty()) {
+                std::unordered_set<std::string> seenIds;
+                size_t changedCount = 0;
+                size_t emittedCount = 0;
+                for (uint16_t addr : dirty) {
+                    const auto* list = controlDb_.lookupByAddr(addr);
+                    if (list) {
+                        for (const auto* desc : *list) {
+                            if (!seenIds.insert(desc->identifier).second) continue;
+                            if (!ShouldLogStateChange(*desc,
+                                                      config_.logRawKnobsDials,
+                                                      config_.logRawGauges)) continue;
 
-                        std::wstring rendered = FormatChange(*desc, stateMap_);
-                        auto [it, inserted] = lastLoggedStates_.emplace(desc->identifier, rendered);
+                            uint32_t value = ReadControlValue(*desc, stateMap_);
+                            auto [it, inserted] = lastLoggedValues_.emplace(desc->identifier, value);
 
-                        if (!logStateChangesPrimed_) {
-                            it->second = rendered;
-                            continue;
-                        }
+                            if (!logStateChangesPrimed_) {
+                                it->second = value;
+                                continue;
+                            }
 
-                        // Suppress startup churn and keep baseline fresh until armed.
-                        if (!loggingArmed) {
-                            it->second = rendered;
-                            continue;
-                        }
+                            // Suppress startup churn and refresh the cached baseline until
+                            // logging is armed. Also skip the exact frame where we seeded the
+                            // settled baseline so the arm transition itself emits no noise.
+                            if (!loggingArmed || seededBaselineThisFrame) {
+                                it->second = value;
+                                continue;
+                            }
 
-                        if (!inserted && it->second == rendered) continue;
+                            if (inserted) {
+                                it->second = value;
+                                continue;
+                            }
 
-                        it->second = rendered;
-                        ++changedCount;
-                        if (emittedCount < 20) {
-                            PostLog(hwnd_, rendered);
-                            ++emittedCount;
+                            if (it->second == value) continue;
+
+                            it->second = value;
+                            ++changedCount;
+                            if (emittedCount < 20) {
+                                PostLog(hwnd_, FormatWireStateChange(*desc, stateMap_));
+                                ++emittedCount;
+                            }
                         }
                     }
                 }
-            }
 
-            if (!logStateChangesPrimed_) {
-                logStateChangesPrimed_ = true;
-            } else if (changedCount > emittedCount) {
-                std::wstringstream m;
-                m << L"  ... and " << (changedCount - emittedCount) << L" more changes.";
-                PostLog(hwnd_, m.str());
+                if (!logStateChangesPrimed_) {
+                    logStateChangesPrimed_ = true;
+                } else if (changedCount > emittedCount) {
+                    std::wstringstream m;
+                    m << L"  ... and " << (changedCount - emittedCount) << L" more changes.";
+                    PostLog(hwnd_, m.str());
+                }
             }
         }
 
@@ -762,11 +841,18 @@ private:
     std::atomic<bool>           winsockInitialized_{false};
     std::mutex                  resourceMutex_;
     std::atomic<uint64_t>       frameCounter_{0};
+    std::atomic<uint64_t>       dispatchFramesMeasured_{0};
+    std::atomic<uint64_t>       dispatchFramesWithWrites_{0};
+    std::atomic<uint64_t>       portWritesMeasured_{0};
+    std::atomic<uint64_t>       avgDispatchUs_{0};
+    std::atomic<uint64_t>       maxDispatchUs_{0};
+    std::atomic<uint64_t>       avgPortWriteUs_{0};
+    std::atomic<uint64_t>       maxPortWriteUs_{0};
     bool                        logStateChanges_ = false;
     bool                        logStateChangesPrimed_ = false;
     std::chrono::steady_clock::time_point logStateChangesArmedAt_ = std::chrono::steady_clock::now();
     bool                        logStateChangesArmedNoticeSent_ = false;
-    std::unordered_map<std::string, std::wstring> lastLoggedStates_;
+    std::unordered_map<std::string, uint32_t> lastLoggedValues_;
 };
 
 // ─── UI state ─────────────────────────────────────────────────────────────────
@@ -793,9 +879,21 @@ struct UiState {
     HBRUSH inputBrush      = nullptr;
     HBRUSH buttonBrush     = nullptr;
     bool activeDryRun      = false;
+    std::wstring statusPrefix = L"Stopped";
     std::wstring logBuffer;
     std::wstring pendingUiLog;
     bool logFlushScheduled = false;
+    size_t pendingUiLineCount = 0;
+    uint64_t droppedUiLines = 0;
+    uint64_t linesReceivedWindow = 0;
+    uint64_t linesRenderedWindow = 0;
+    double linesReceivedPerSec = 0.0;
+    double linesRenderedPerSec = 0.0;
+    double avgFlushMs = 0.0;
+    double maxFlushMs = 0.0;
+    uint64_t flushCount = 0;
+    bool queueOverloadNoticeShown = false;
+    std::chrono::steady_clock::time_point metricsWindowStartedAt = std::chrono::steady_clock::now();
     std::unique_ptr<BridgeController> controller;
     StartupOptions startupOptions;
 };
@@ -831,8 +929,10 @@ void LayoutControls(UiState* state, int W, int H) {
     MoveWindow(state->rawGaugesCheckbox, margin + 230, y + 2, 220, 22, TRUE);
 
     y += rowH + gap + 16;
-    MoveWindow(state->statusText, margin,                        y, 320, 26, TRUE);
-    MoveWindow(state->hintLabel,  std::max(margin, W - margin - 220), y, 220, 26, TRUE);
+    int hintW = 220;
+    int statusW = std::max(320, W - margin * 2 - hintW - gap);
+    MoveWindow(state->statusText, margin, y, statusW, 26, TRUE);
+    MoveWindow(state->hintLabel,  margin + statusW + gap, y, hintW, 26, TRUE);
 
     y += 28 + gap + 12;
     int logH = std::max(120, H - y - margin);
@@ -844,19 +944,153 @@ void LayoutControls(UiState* state, int W, int H) {
 UiState* GetUiState(HWND hwnd) {
     return reinterpret_cast<UiState*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
 }
-void SetStatus(UiState* s, const std::wstring& t) { SetWindowTextW(s->statusText, t.c_str()); }
+
+size_t CountLogicalLines(const std::wstring& text) {
+    if (text.empty()) return 0;
+
+    size_t lines = 0;
+    for (wchar_t ch : text) {
+        if (ch == L'\n') ++lines;
+    }
+    return lines == 0 ? 1 : lines;
+}
+
+void UpdateStatusText(UiState* s) {
+    if (!s || !s->statusText) return;
+
+    if (!s->controller || !s->controller->IsRunning()) {
+        SetWindowTextW(s->statusText, s->statusPrefix.c_str());
+        return;
+    }
+
+    std::wstringstream status;
+    status << s->statusPrefix
+           << L" | q:" << s->pendingUiLineCount
+           << L" drop:" << s->droppedUiLines
+           << L" rx:" << std::fixed << std::setprecision(0) << s->linesReceivedPerSec << L"/s"
+           << L" ui:" << std::fixed << std::setprecision(0) << s->linesRenderedPerSec << L"/s"
+           << L" flush:" << std::fixed << std::setprecision(1) << s->avgFlushMs << L"/" << s->maxFlushMs << L" ms";
+
+    if (s->controller) {
+        auto dispatch = s->controller->GetDispatchMetrics();
+        status << L" tx:" << std::fixed << std::setprecision(2)
+               << (static_cast<double>(dispatch.avgDispatchUs) / 1000.0)
+               << L"/" << (static_cast<double>(dispatch.maxDispatchUs) / 1000.0) << L" ms"
+               << L" port:" << (static_cast<double>(dispatch.avgPortWriteUs) / 1000.0)
+               << L"/" << (static_cast<double>(dispatch.maxPortWriteUs) / 1000.0) << L" ms";
+    }
+
+    if (s->pendingUiLineCount >= (kMaxPendingUiLines / 2) || s->droppedUiLines > 0) {
+        status << L" [UI lag]";
+    }
+
+    SetWindowTextW(s->statusText, status.str().c_str());
+}
+
+void SetStatus(UiState* s, const std::wstring& t) {
+    if (!s) return;
+    s->statusPrefix = t;
+    UpdateStatusText(s);
+}
+
+void ResetUiMetrics(UiState* s) {
+    if (!s) return;
+
+    s->pendingUiLineCount = 0;
+    s->droppedUiLines = 0;
+    s->linesReceivedWindow = 0;
+    s->linesRenderedWindow = 0;
+    s->linesReceivedPerSec = 0.0;
+    s->linesRenderedPerSec = 0.0;
+    s->avgFlushMs = 0.0;
+    s->maxFlushMs = 0.0;
+    s->flushCount = 0;
+    s->queueOverloadNoticeShown = false;
+    s->metricsWindowStartedAt = std::chrono::steady_clock::now();
+}
+
+void UpdateUiRates(UiState* s) {
+    if (!s) return;
+
+    auto now = std::chrono::steady_clock::now();
+    std::chrono::duration<double> elapsed = now - s->metricsWindowStartedAt;
+    if (elapsed.count() < 1.0) return;
+
+    s->linesReceivedPerSec = static_cast<double>(s->linesReceivedWindow) / elapsed.count();
+    s->linesRenderedPerSec = static_cast<double>(s->linesRenderedWindow) / elapsed.count();
+    s->linesReceivedWindow = 0;
+    s->linesRenderedWindow = 0;
+    s->metricsWindowStartedAt = now;
+}
+
+void RecordUiFlush(UiState* s, size_t renderedLines, double flushMs) {
+    if (!s) return;
+
+    s->linesRenderedWindow += renderedLines;
+    ++s->flushCount;
+    double sampleCount = static_cast<double>(s->flushCount);
+    s->avgFlushMs += (flushMs - s->avgFlushMs) / sampleCount;
+    s->maxFlushMs = std::max(s->maxFlushMs, flushMs);
+}
+
 void ApplyFont(UiState* s, HWND c) {
     if (s && c && s->uiFont) SendMessage(c, WM_SETFONT, reinterpret_cast<WPARAM>(s->uiFont), TRUE);
 }
-void AppendToLogControl(UiState* s, const std::wstring& text) {
+
+void ScrollLogControlToBottom(UiState* s) {
+    if (!s || !s->logText) return;
+
+    int end = GetWindowTextLengthW(s->logText);
+    SendMessage(s->logText, EM_SETSEL, end, end);
+    SendMessage(s->logText, EM_SCROLLCARET, 0, 0);
+    SendMessage(s->logText, WM_VSCROLL, SB_BOTTOM, 0);
+}
+
+void TrimLogControlToMaxLines(UiState* s) {
+    if (!s || !s->logText) return;
+
     int n = GetWindowTextLengthW(s->logText);
-    if (n > 120000) {
-        SendMessage(s->logText, EM_SETSEL, 0, 40000);
-        SendMessage(s->logText, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(L""));
-        n = GetWindowTextLengthW(s->logText);
+    if (n <= 0) return;
+
+    std::wstring text(static_cast<size_t>(n) + 1, L'\0');
+    GetWindowTextW(s->logText, text.data(), n + 1);
+    text.resize(static_cast<size_t>(n));
+
+    size_t lineCount = CountLogicalLines(text);
+    if (lineCount <= kMaxUiDisplayLines) return;
+
+    size_t linesToDrop = lineCount - kMaxUiDisplayLines;
+    size_t cutPos = 0;
+    while (cutPos < text.size() && linesToDrop > 0) {
+        if (text[cutPos] == L'\n') {
+            --linesToDrop;
+        }
+        ++cutPos;
     }
+
+    if (cutPos > 0) {
+        SendMessage(s->logText, EM_SETSEL, 0, static_cast<LPARAM>(cutPos));
+        SendMessage(s->logText, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(L""));
+        ScrollLogControlToBottom(s);
+    }
+}
+
+void AppendToLogControl(UiState* s, const std::wstring& text) {
+    if (!s || !s->logText) return;
+
+    // Update the edit control as one visual transaction. We do briefly select
+    // the oldest text while trimming the ring buffer, but suppress redraw until
+    // the control is re-anchored at the newest line so the user never sees the
+    // thumb or caret jump to the top mid-update.
+    SendMessage(s->logText, WM_SETREDRAW, FALSE, 0);
+    int n = GetWindowTextLengthW(s->logText);
     SendMessage(s->logText, EM_SETSEL, n, n);
     SendMessage(s->logText, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(text.c_str()));
+    TrimLogControlToMaxLines(s);
+    ScrollLogControlToBottom(s);
+    SendMessage(s->logText, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(s->logText, nullptr, TRUE);
+    UpdateWindow(s->logText);
 }
 
 void AppendToLog(UiState* s, const std::wstring& text) {
@@ -944,6 +1178,7 @@ void ToggleBridge(HWND hwnd) {
 
     if (!s->controller->Start(cfg)) { SetStatus(s, L"Start failed"); return; }
 
+    ResetUiMetrics(s);
     SetWindowTextW(s->toggleButton, L"Stop");
     std::wstring status = cfg.useUdp ? L"Running (UDP" : L"Running (TCP";
     if (cfg.dryRun) status += L", Dry-Run";
@@ -1018,6 +1253,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         LayoutControls(s, rc.right, rc.bottom);
 
         RegisterHotKey(hwnd, kHotkeyId, MOD_NOREPEAT, VK_F8);
+        SetTimer(hwnd, kStatusRefreshTimer, kStatusRefreshIntervalMs, nullptr);
         return 0;
     }
 
@@ -1112,9 +1348,20 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             KillTimer(hwnd, kLogFlushTimer);
             s->logFlushScheduled = false;
             if (!s->pendingUiLog.empty()) {
+                size_t renderedLines = s->pendingUiLineCount;
+                auto flushStart = std::chrono::steady_clock::now();
                 AppendToLogControl(s, s->pendingUiLog);
+                auto flushEnd = std::chrono::steady_clock::now();
+                double flushMs = std::chrono::duration<double, std::milli>(flushEnd - flushStart).count();
+                RecordUiFlush(s, renderedLines, flushMs);
                 s->pendingUiLog.clear();
+                s->pendingUiLineCount = 0;
             }
+            UpdateUiRates(s);
+            UpdateStatusText(s);
+        } else if (wParam == kStatusRefreshTimer) {
+            UpdateUiRates(s);
+            UpdateStatusText(s);
         }
         return 0;
     }
@@ -1124,12 +1371,35 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         if (s) {
             auto* payload = reinterpret_cast<std::wstring*>(lParam);
             if (payload) {
+                size_t incomingLines = CountLogicalLines(*payload);
                 s->logBuffer += *payload;
-                s->pendingUiLog += *payload;
-                if (!s->logFlushScheduled) {
-                    SetTimer(hwnd, kLogFlushTimer, kLogFlushIntervalMs, nullptr);
-                    s->logFlushScheduled = true;
+                s->linesReceivedWindow += incomingLines;
+
+                if (s->pendingUiLineCount + incomingLines > kMaxPendingUiLines) {
+                    s->droppedUiLines += incomingLines;
+
+                    // Preserve the full in-memory capture while dropping only the
+                    // queued UI work. This keeps overload visible without implying
+                    // the serial/export pipeline itself lost data.
+                    if (!s->queueOverloadNoticeShown) {
+                        AppendToLogControl(s, L"[ui] Pending render queue exceeded limit; dropping queued UI lines until it recovers.\r\n");
+                        s->queueOverloadNoticeShown = true;
+                    }
+                } else {
+                    s->pendingUiLog += *payload;
+                    s->pendingUiLineCount += incomingLines;
+                    if (!s->logFlushScheduled) {
+                        SetTimer(hwnd, kLogFlushTimer, kLogFlushIntervalMs, nullptr);
+                        s->logFlushScheduled = true;
+                    }
                 }
+
+                if (s->pendingUiLineCount == 0) {
+                    s->queueOverloadNoticeShown = false;
+                }
+
+                UpdateUiRates(s);
+                UpdateStatusText(s);
                 delete payload;
             }
         }
@@ -1152,9 +1422,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         UiState* s = GetUiState(hwnd);
         if (s) {
             if (s->logFlushScheduled) KillTimer(hwnd, kLogFlushTimer);
+            KillTimer(hwnd, kStatusRefreshTimer);
             if (!s->pendingUiLog.empty()) {
                 AppendToLogControl(s, s->pendingUiLog);
                 s->pendingUiLog.clear();
+                s->pendingUiLineCount = 0;
             }
             if (s->controller) s->controller->Stop();
             UnregisterHotKey(hwnd, kHotkeyId);
